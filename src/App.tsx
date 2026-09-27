@@ -107,6 +107,19 @@ export default function App() {
     setNearbyRows(new Map())
   }
 
+  /**
+   * Any edit to the input text invalidates everything derived from the
+   * previous text: batch results, nearby witnesses, and any in-flight solve
+   * (bumping the request id makes its late response a no-op).
+   */
+  function invalidateDerived() {
+    requestIdRef.current += 1
+    revokeNearby()
+    setTargets([])
+    setReachable([])
+    setStatus({ kind: 'idle' })
+  }
+
   function computeWith(value: string) {
     const worker = workerRef.current
     if (!worker) return
@@ -155,8 +168,19 @@ export default function App() {
   function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
     const pasted = event.clipboardData.getData('text')
     if (!pasted) return
-    // Commit pasted text, then compute on the next frame.
-    requestAnimationFrame(() => computeWith(pasted))
+    // The pasted fragment alone is not the input: it is inserted at the
+    // selection, possibly replacing part of the existing text. Compute on
+    // the textarea's resulting content, and only if it still holds the
+    // paste-produced value when the frame runs — a later edit, 清空, or
+    // 填入示例 must win over this scheduled compute.
+    const el = event.currentTarget
+    const start = el.selectionStart ?? el.value.length
+    const end = el.selectionEnd ?? el.value.length
+    const expected = el.value.slice(0, start) + pasted + el.value.slice(end)
+    requestAnimationFrame(() => {
+      if (el.value !== expected) return
+      computeWith(el.value)
+    })
   }
 
   return (
@@ -183,7 +207,10 @@ export default function App() {
             spellCheck={false}
             placeholder='{"a":[0,3],"b":[1,2],"targets":[1,3,4]}'
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value)
+              invalidateDerived()
+            }}
             onPaste={handlePaste}
           />
           <div className="actions">
@@ -197,7 +224,10 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => setText(SAMPLE_INPUT)}
+              onClick={() => {
+                setText(SAMPLE_INPUT)
+                invalidateDerived()
+              }}
               disabled={status.kind === 'running'}
             >
               填入示例
@@ -206,10 +236,7 @@ export default function App() {
               type="button"
               onClick={() => {
                 setText('')
-                revokeNearby()
-                setTargets([])
-                setReachable([])
-                setStatus({ kind: 'idle' })
+                invalidateDerived()
               }}
               disabled={status.kind === 'running'}
             >

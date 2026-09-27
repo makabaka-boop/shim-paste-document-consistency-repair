@@ -7,7 +7,7 @@
  * protocol handler, so cache/revocation semantics are genuinely exercised.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, createEvent, cleanup, act } from '@testing-library/react'
 import App from './App'
 import { createSolverEngine } from './lib/engine'
 import { handleRequest, type WorkerRequest, type WorkerResponse } from './lib/protocol'
@@ -92,6 +92,40 @@ function nearbyButtons() {
 
 function setJson(value: string) {
   fireEvent.change(jsonInput(), { target: { value } })
+}
+
+/** Capture rAF callbacks so paste-scheduled computes run when the test says. */
+function stubAnimationFrame() {
+  const callbacks: FrameRequestCallback[] = []
+  vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+    callbacks.push(cb)
+    return callbacks.length
+  })
+  return {
+    pendingCount: () => callbacks.length,
+    runAll() {
+      const pending = callbacks.splice(0)
+      for (const cb of pending) cb(0)
+    },
+  }
+}
+
+/**
+ * Fire a paste of `fragment` replacing the textarea's current selection, then
+ * apply the browser's default insertion ourselves (jsdom skips it), leaving
+ * the textarea exactly as a real browser would before the next frame.
+ */
+function pasteReplacingSelection(fragment: string, start: number, end: number) {
+  const el = jsonInput() as HTMLTextAreaElement
+  el.setSelectionRange(start, end)
+  const event = createEvent.paste(el)
+  Object.defineProperty(event, 'clipboardData', {
+    value: { getData: () => fragment },
+  })
+  fireEvent(el, event)
+  const merged = el.value.slice(0, start) + fragment + el.value.slice(end)
+  fireEvent.change(el, { target: { value: merged } })
+  return merged
 }
 
 async function compute(value: string) {
@@ -236,8 +270,7 @@ describe('App — failure handling', () => {
   })
 })
 
-describe('App — invalid tolerance keeps the last valid nearby query', () => {
-  it('retains the previous verdict and issues no new request', async () => {
+describe('App — invalid tolerance keeps the last valid nearby query', () => {  it('retains the previous verdict and issues no new request', async () => {
     render(<App />)
     const w = worker()
     await compute(JSON.stringify({ a: [0, 3], b: [1, 2], targets: [100] }))
@@ -269,5 +302,133 @@ describe('App — invalid tolerance keeps the last valid nearby query', () => {
     expect(w.nearbyRequestCount()).toBe(2)
     expect(screen.getByText('容差内无可达')).toBeTruthy()
     expect(screen.queryByText('A=3 B=2 偏差-95')).toBeNull()
+  })
+})
+
+describe('App — paste auto-compute uses the final text', () => {
+  it('a partial paste computes on the merged content, not the fragment', async () => {
+    const raf = stubAnimationFrame()
+    render(<App />)
+    const w = worker()
+
+    // Existing input; the user selects the targets array and pastes over it.
+    const initial = JSON.stringify({ a: [0, 3], b: [1, 2], targets: [4] })
+    setJson(initial)
+    const start = initial.indexOf('[4]')
+    const merged = pasteReplacingSelection('[100,4]', start, start + 3)
+    expect(merged).toBe(JSON.stringify({ a: [0, 3], b: [1, 2], targets: [100, 4] }))
+
+    act(() => raf.runAll())
+    await flush()
+
+    // The solve request carried the full merged text, not the pasted fragment.
+    const solves = w.requests.filter((r) => r.kind === 'solve')
+    expect(solves).toHaveLength(1)
+    expect(solves[0]).toMatchObject({ kind: 'solve', text: merged })
+
+    const verdicts = [...document.querySelectorAll('.results-viewport .cell-verdict')]
+    expect(verdicts.map((el) => el.textContent)).toEqual(['false', 'true'])
+  })
+
+  it('清空 before the scheduled frame cancels the paste compute', async () => {
+    const raf = stubAnimationFrame()
+    render(<App />)
+    const w = worker()
+
+    pasteReplacingSelection(JSON.stringify({ a: [0], b: [1], targets: [1] }), 0, 0)
+    expect(raf.pendingCount()).toBe(1)
+
+    // The user clears the input before the next frame runs.
+    fireEvent.click(screen.getByRole('button', { name: '清空' }))
+    act(() => raf.runAll())
+    await flush()
+
+    // No solve was issued and nothing re-appears afterwards.
+    expect(w.requests.filter((r) => r.kind === 'solve')).toHaveLength(0)
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+    expect(screen.queryByText('INVALID_INPUT')).toBeNull()
+    expect(nearbyButtons()).toHaveLength(0)
+  })
+
+  it('填入示例 before the scheduled frame cancels the paste compute', async () => {
+    const raf = stubAnimationFrame()
+    render(<App />)
+    const w = worker()
+
+    pasteReplacingSelection(JSON.stringify({ a: [0], b: [1], targets: [1] }), 0, 0)
+    fireEvent.click(screen.getByRole('button', { name: '填入示例' }))
+    act(() => raf.runAll())
+    await flush()
+
+    expect(w.requests.filter((r) => r.kind === 'solve')).toHaveLength(0)
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+  })
+})
+
+describe('App — manual edits invalidate previous conclusions', () => {
+  it('editing the text clears batch results and the nearby witness', async () => {
+    const { container } = render(<App />)
+    await compute(INPUT_A)
+    fireEvent.click(nearbyButtons()[3])
+    await flush()
+    expect(screen.getByText('A=3 B=2 偏差-95')).toBeTruthy()
+
+    setJson(INPUT_A + ' ')
+
+    expect(screen.queryByText('A=3 B=2 偏差-95')).toBeNull()
+    expect(container.querySelectorAll('.nearby-result')).toHaveLength(0)
+    expect(container.querySelectorAll('.results-viewport .result-row')).toHaveLength(0)
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+  })
+
+  it('a solve response for pre-edit text landing after the edit is discarded', async () => {
+    render(<App />)
+    const w = worker()
+    w.autoFlush = false
+
+    setJson(INPUT_A)
+    fireEvent.click(computeButton())
+    expect(screen.getByText('正在精确求解…')).toBeTruthy()
+
+    // The user edits the text while the solve is in flight.
+    setJson(INPUT_B)
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+
+    // The in-flight response arrives late and must not resurrect old results.
+    await act(async () => {
+      w.flushAll()
+    })
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+    expect(document.querySelectorAll('.results-viewport .result-row')).toHaveLength(0)
+
+    // Recomputing on the current text still works.
+    fireEvent.click(computeButton())
+    await act(async () => {
+      w.flushAll()
+    })
+    const targets = [...document.querySelectorAll('.results-viewport .cell-target')]
+    expect(targets.map((el) => el.textContent)).toEqual(['30'])
+  })
+
+  it('填入示例 and 清空 drop the previous results and witness', async () => {
+    const { container } = render(<App />)
+    await compute(INPUT_A)
+    fireEvent.click(nearbyButtons()[3])
+    await flush()
+    expect(screen.getByText('A=3 B=2 偏差-95')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: '填入示例' }))
+    expect(screen.queryByText('A=3 B=2 偏差-95')).toBeNull()
+    expect(container.querySelectorAll('.results-viewport .result-row')).toHaveLength(0)
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+
+    // Compute the sample, then clear: nothing from before may remain.
+    fireEvent.click(computeButton())
+    await flush()
+    expect(nearbyButtons().length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: '清空' }))
+    expect(container.querySelectorAll('.results-viewport .result-row')).toHaveLength(0)
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+    expect((jsonInput() as HTMLTextAreaElement).value).toBe('')
   })
 })
