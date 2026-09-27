@@ -6,6 +6,7 @@ import { VirtualResults, type NearbyVerdict } from './components/VirtualResults'
 type Status =
   | { kind: 'idle' }
   | { kind: 'running' }
+  | { kind: 'stale' }
   | { kind: 'invalid' }
   | {
       kind: 'ok'
@@ -107,18 +108,41 @@ export default function App() {
     setNearbyRows(new Map())
   }
 
+  function invalidateResults() {
+    // A new solve request/input draft invalidates both displayed answers and
+    // every response which has not arrived yet.
+    requestIdRef.current += 1
+    revokeNearby()
+    setTargets([])
+    setReachable([])
+  }
+
   function computeWith(value: string) {
     const worker = workerRef.current
     if (!worker) return
-    const id = ++requestIdRef.current
-    revokeNearby()
+    invalidateResults()
+    const id = requestIdRef.current
     setStatus({ kind: 'running' })
-    // Drop any previous answers up front so stale results never linger
-    // while the new (potentially invalid) request is handled.
-    setTargets([])
-    setReachable([])
     const request: WorkerRequest = { kind: 'solve', id, text: value }
     worker.postMessage(request)
+  }
+
+  function handleTextChange(value: string) {
+    setText(value)
+    invalidateResults()
+    setStatus({ kind: 'stale' })
+  }
+
+  function clearInput() {
+    setText('')
+    invalidateResults()
+    setStatus({ kind: 'idle' })
+  }
+
+  function loadSample() {
+    setText(SAMPLE_INPUT)
+    invalidateResults()
+    setStatus({ kind: 'stale' })
   }
 
   const queryNearby = useCallback(
@@ -155,8 +179,17 @@ export default function App() {
   function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
     const pasted = event.clipboardData.getData('text')
     if (!pasted) return
-    // Commit pasted text, then compute on the next frame.
-    requestAnimationFrame(() => computeWith(pasted))
+
+    // Compute from the value that the controlled input is about to contain.
+    // Reading only `pasted` would be wrong for a local (selection) paste,
+    // where surrounding JSON remains outside the replaced range.
+    event.preventDefault()
+    const input = event.currentTarget
+    const start = input.selectionStart ?? text.length
+    const end = input.selectionEnd ?? text.length
+    const nextValue = text.slice(0, start) + pasted + text.slice(end)
+    setText(nextValue)
+    computeWith(nextValue)
   }
 
   return (
@@ -183,7 +216,7 @@ export default function App() {
             spellCheck={false}
             placeholder='{"a":[0,3],"b":[1,2],"targets":[1,3,4]}'
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => handleTextChange(e.target.value)}
             onPaste={handlePaste}
           />
           <div className="actions">
@@ -195,30 +228,19 @@ export default function App() {
             >
               {status.kind === 'running' ? '计算中…' : '计算可达性'}
             </button>
-            <button
-              type="button"
-              onClick={() => setText(SAMPLE_INPUT)}
-              disabled={status.kind === 'running'}
-            >
+            <button type="button" onClick={loadSample}>
               填入示例
             </button>
-            <button
-              type="button"
-              onClick={() => {
-                setText('')
-                revokeNearby()
-                setTargets([])
-                setReachable([])
-                setStatus({ kind: 'idle' })
-              }}
-              disabled={status.kind === 'running'}
-            >
+            <button type="button" onClick={clearInput}>
               清空
             </button>
           </div>
 
           <div className="status-area" aria-live="polite">
             {status.kind === 'idle' && <p className="status idle">等待输入。</p>}
+            {status.kind === 'stale' && (
+              <p className="status idle">输入已修改，请重新计算。</p>
+            )}
             {status.kind === 'running' && (
               <p className="status running">正在精确求解…</p>
             )}

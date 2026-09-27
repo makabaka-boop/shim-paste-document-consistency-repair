@@ -86,6 +86,14 @@ function computeButton() {
   return screen.getByRole('button', { name: '计算可达性' })
 }
 
+function clearButton() {
+  return screen.getByRole('button', { name: '清空' })
+}
+
+function sampleButton() {
+  return screen.getByRole('button', { name: '填入示例' })
+}
+
 function nearbyButtons() {
   return screen.queryAllByRole('button', { name: '邻近查询' })
 }
@@ -233,6 +241,90 @@ describe('App — failure handling', () => {
     fireEvent.click(nearbyButtons()[0])
     await flush()
     expect(screen.getByText('A=10 B=20 偏差0')).toBeTruthy()
+  })
+})
+
+describe('App — input consistency', () => {
+  it('computes a local paste from the final textarea value, not only the pasted fragment', async () => {
+    const { container } = render(<App />)
+
+    setJson('{"a":[0,3],"b":[1,2],"targets":[4,1]}')
+    const input = jsonInput() as HTMLTextAreaElement
+    input.focus()
+    input.setSelectionRange(34, 35)
+    fireEvent.paste(input, {
+      clipboardData: { getData: () => '100' },
+    })
+    await flush()
+
+    expect(input.value).toBe('{"a":[0,3],"b":[1,2],"targets":[4,100]}')
+    const targets = [...container.querySelectorAll('.results-viewport .cell-target')]
+    expect(targets.map((el) => el.textContent)).toEqual(['4', '100'])
+    const verdicts = [...container.querySelectorAll('.results-viewport .cell-verdict')]
+    expect(verdicts.map((el) => el.textContent)).toEqual(['true', 'false'])
+  })
+
+  it('clears batch results and nearby witnesses as soon as the JSON is manually edited', async () => {
+    const { container } = render(<App />)
+    await compute(INPUT_A)
+    fireEvent.click(nearbyButtons()[3])
+    await flush()
+    expect(screen.getByText('A=3 B=2 偏差-95')).toBeTruthy()
+
+    setJson(`${INPUT_A} `)
+
+    expect(screen.getByText('输入已修改，请重新计算。')).toBeTruthy()
+    expect(container.querySelectorAll('.results-viewport')).toHaveLength(0)
+    expect(screen.queryByText('A=3 B=2 偏差-95')).toBeNull()
+    expect(nearbyButtons()).toHaveLength(0)
+  })
+
+  it('drops a solve response when the input is changed before it arrives', async () => {
+    render(<App />)
+    const w = worker()
+    w.autoFlush = false
+
+    setJson(INPUT_A)
+    fireEvent.click(computeButton())
+
+    // The engineer keeps typing while the solve response is still queued.
+    setJson(`${INPUT_A} `)
+    w.flushAll()
+    await flush()
+
+    expect(screen.getByText('输入已修改，请重新计算。')).toBeTruthy()
+    expect(nearbyButtons()).toHaveLength(0)
+  })
+
+  it('does not restore a queued result after clearing the input', async () => {
+    render(<App />)
+    const w = worker()
+    w.autoFlush = false
+
+    setJson(INPUT_A)
+    fireEvent.click(computeButton())
+    fireEvent.click(clearButton())
+    w.flushAll()
+    await flush()
+
+    expect((jsonInput() as HTMLTextAreaElement).value).toBe('')
+    expect(screen.getByText('等待输入。')).toBeTruthy()
+    expect(nearbyButtons()).toHaveLength(0)
+  })
+
+  it('does not restore a queued result after loading the sample', async () => {
+    render(<App />)
+    const w = worker()
+    w.autoFlush = false
+
+    setJson(INPUT_A)
+    fireEvent.click(computeButton())
+    fireEvent.click(sampleButton())
+    w.flushAll()
+    await flush()
+
+    expect(screen.getByText('输入已修改，请重新计算。')).toBeTruthy()
+    expect(nearbyButtons()).toHaveLength(0)
   })
 })
 
